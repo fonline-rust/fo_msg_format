@@ -1,26 +1,31 @@
-use nom_prelude::{complete::*, *};
+use nom_prelude::{complete::*, nom::AsChar, *};
 
 use super::{Entry, Line, Msg};
 
-pub(crate) fn tokenize_msg(input: &str, exhaustive: bool) -> Result<Msg<'_>, String> {
-    let (rest, res) = nom_err_to_string(input, msg(input))?;
-    if !exhaustive || rest.is_empty() {
+pub(crate) fn tokenize_msg<I: StringLikeInput>(
+    input: I,
+    exhaustive: bool,
+) -> Result<Msg<I>, String> {
+    let (rest, res) = input.err_to_string(msg(input))?;
+    if !exhaustive || rest.input_len() == 0 {
         Ok(res)
     } else {
-        Err(format!(
-            "Failed to exhaust input to the end: {}",
-            rest.chars().take(20).collect::<String>()
-        ))
+        let tail: String = rest
+            .iter_elements()
+            .take(20)
+            .map(|ch| ch.as_char())
+            .collect();
+        Err(format!("Failed to exhaust input to the end: {tail}",))
     }
 }
 
-fn msg<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&'a str, Msg<'a>, E> {
+fn msg<I: StringLikeInput, E: ParseError<I>>(i: I) -> IResult<I, Msg<I>, E> {
     map(separated_list_first_unchecked(t_rn, line), |lines| Msg {
         lines,
     })(i)
 }
 
-fn line<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&'a str, Line<'a>, E> {
+fn line<I: StringLikeInput, E: ParseError<I>>(i: I) -> IResult<I, Line<I>, E> {
     alt((
         map(comment, Line::Comment),
         //map(char('#'), |_| Line::Comment("")),
@@ -29,13 +34,12 @@ fn line<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&'a str, Line<'a>, E>
     ))(i)
 }
 
-fn comment<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&'a str, &'a str, E> {
-    preceded(pair(space0, char('#')), optional_text)(i)
+fn comment<I: StringLikeInput, E: ParseError<I>>(i: I) -> IResult<I, I, E> {
+    let alt = alt((recognize(char('#')), recognize(tag("//"))));
+    preceded(pair(space0, alt), optional_text)(i)
 }
 
-fn _entry_with_tuple<'a, E: ParseError<&'a str>>(
-    ref mut i: &'a str,
-) -> IResult<&'a str, Entry<'a>, E> {
+fn _entry_with_tuple<I: StringLikeInput, E: ParseError<I>>(i: I) -> IResult<I, Entry<I>, E> {
     map(
         tuple((
             curly_delimited(unsigned_number),
@@ -52,9 +56,7 @@ fn _entry_with_tuple<'a, E: ParseError<&'a str>>(
     )(i)
 }
 
-fn _entry_with_macro<'a, E: ParseError<&'a str>>(
-    ref mut i: &'a str,
-) -> IResult<&'a str, Entry<'a>, E> {
+fn _entry_with_macro<I: StringLikeInput, E: ParseError<I>>(i: I) -> IResult<I, Entry<I>, E> {
     Ok(parse_struct!(
         i,
         Entry {
@@ -66,30 +68,30 @@ fn _entry_with_macro<'a, E: ParseError<&'a str>>(
     ))
 }
 
-fn entry_with_apply<'a, E: ParseError<&'a str>>(
-    ref mut i: &'a str,
-) -> IResult<&'a str, Entry<'a>, E> {
+fn entry_with_apply<I: StringLikeInput, E: ParseError<I>>(mut i: I) -> IResult<I, Entry<I>, E> {
     let entry = Entry {
-        index: apply(i, curly_delimited(unsigned_number))?,
-        secondary: apply(i, curly_delimited(not_closing_curly))?,
-        value: apply(i, curly_delimited(not_closing_curly))?,
-        comment: apply(i, opt(comment))?,
+        index: apply(&mut i, curly_delimited(cut(unsigned_number)))?,
+        secondary: cut_apply(&mut i, curly_delimited(not_closing_curly))?,
+        value: cut_apply(&mut i, curly_delimited(not_closing_curly))?,
+        comment: cut_apply(&mut i, opt(comment))?,
     };
     Ok((i, entry))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Debug;
+
     use super::*;
 
-    fn lex<'a, T: 'a, F>(fun: F, str: &'a str) -> T
+    fn lex<I: Debug + StringLikeInput, T, F>(fun: F, input: I) -> T
     where
-        F: FnOnce(&'a str) -> IResult<&'a str, T, nom::error::VerboseError<&'a str>>,
+        F: FnOnce(I) -> IResult<I, T, nom::error::VerboseError<I>>,
     {
-        fun(str).unwrap().1
+        fun(input).unwrap().1
     }
 
-    fn with_all_entry_impls(sample: &str, correct: &Entry) {
+    fn with_all_entry_impls<I: Debug + StringLikeInput>(sample: I, correct: &Entry<I>) {
         assert_eq!(&lex(_entry_with_tuple, sample), correct);
         assert_eq!(&lex(_entry_with_macro, sample), correct);
         assert_eq!(&lex(entry_with_apply, sample), correct);
@@ -98,7 +100,7 @@ mod tests {
     #[test]
     fn test_all_entry_impls() {
         const SAMPLE: &str = "{1}{foo}{bar}";
-        const CORRECT: Entry = Entry {
+        const CORRECT: Entry<&str> = Entry {
             index: 1,
             secondary: "foo",
             value: "bar",
@@ -106,8 +108,19 @@ mod tests {
         };
         with_all_entry_impls(SAMPLE, &CORRECT);
     }
+    #[test]
+    fn test_all_entry_impls_bytes() {
+        const SAMPLE: &[u8] = b"{1}{foo}{bar}";
+        const CORRECT: Entry<&[u8]> = Entry {
+            index: 1,
+            secondary: b"foo",
+            value: b"bar",
+            comment: None,
+        };
+        with_all_entry_impls(SAMPLE, &CORRECT);
+    }
 
-    fn new_entry<'a>(index: u32, secondary: &'a str, value: &'a str) -> Entry<'a> {
+    fn new_entry<I: StringLikeInput>(index: u32, secondary: I, value: I) -> Entry<I> {
         Entry {
             index,
             secondary,
@@ -115,13 +128,24 @@ mod tests {
             comment: None,
         }
     }
-    fn entry_line<'a>(index: u32, secondary: &'a str, value: &'a str) -> Line<'a> {
+    fn entry_line<I: StringLikeInput>(index: u32, secondary: I, value: I) -> Line<I> {
         Line::Entry(Entry {
             index,
             secondary,
             value,
             comment: None,
         })
+    }
+
+    impl<'a> Entry<&'a str> {
+        fn as_bytes(&self) -> Entry<&'a [u8]> {
+            Entry {
+                index: self.index,
+                secondary: self.secondary.as_bytes(),
+                value: self.value.as_bytes(),
+                comment: self.comment.map(|comment| comment.as_bytes()),
+            }
+        }
     }
 
     #[test]
@@ -139,7 +163,10 @@ mod tests {
             ),
         ];
         for (sample, correct) in samples {
-            with_all_entry_impls(sample, correct);
+            with_all_entry_impls(*sample, correct);
+        }
+        for (sample, correct) in samples {
+            with_all_entry_impls(sample.as_bytes(), &correct.as_bytes());
         }
     }
 
